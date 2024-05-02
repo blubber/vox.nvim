@@ -1,7 +1,16 @@
+local backend = require("vox.backend")
+
 local default_config = {
-	rate = 1.0,
-	pitch = 1.0,
-	volume = 1.0,
+	backend = backend,
+	wait_time = 25,
+
+	modes = {
+		c = "Command",
+		i = "Insert",
+		n = "Normal",
+		v = "Visual",
+		V = "Visual line",
+	},
 }
 
 local config = {}
