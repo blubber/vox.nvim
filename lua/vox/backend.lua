@@ -14,7 +14,12 @@ function M:speak(utterances)
 	local body = {}
 
 	for _, u in ipairs(utterances) do
-		table.insert(body, { text = u.text, voice = routing[u.source] or "__default" })
+		local voice = routing[u.source] or "__default"
+		if u.special then
+			voice = _VoxBackendConfig.special_char_voice or voice
+		end
+
+		table.insert(body, { text = u.text, voice = voice })
 	end
 
 	local json = vim.fn.json_encode(body)

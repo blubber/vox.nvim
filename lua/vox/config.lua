@@ -11,6 +11,27 @@ local default_config = {
 		v = "Visual",
 		V = "Visual line",
 	},
+
+	postprocess = nil,
+
+	char_map = {
+		["("] = "L par",
+		[")"] = "R par",
+		["{"] = "L brace",
+		["}"] = "R brace",
+		["["] = "L bracket",
+		["]"] = "R bracker",
+		["<"] = "L angle",
+		[">"] = "R angle",
+		["."] = "period",
+		[","] = "comma",
+		[";"] = "semi colon",
+		[":"] = "colon",
+		['"'] = "double quote",
+		["'"] = "quote",
+		["`"] = "tick",
+		["~"] = "tilde",
+	},
 }
 
 local config = {}
@@ -26,10 +47,15 @@ M.setup = function(user_config)
 
 	user_config = user_config or {}
 	for key, value in pairs(user_config) do
-		if config[key] ~= nil then
-			config[key] = value
-		end
+		config[key] = value
 	end
+
+	local pattern = {}
+	for k, _ in pairs(config.char_map) do
+		table.insert(pattern, string.format("%%%s", k))
+	end
+
+	config._char_map_pattern = string.format("[%s]", table.concat(pattern, ""))
 end
 
 return M

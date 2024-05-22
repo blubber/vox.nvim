@@ -1,8 +1,10 @@
 local log = require("vox.dev").log
 local config = require("vox.config")
+local utils = require("vox.utils")
 
 local M = {}
 
+local mode = "n"
 local cursor_pos = { 1, 0 }
 local scheduled_utterances = {}
 local scheduled_utterances_timer = nil
@@ -59,7 +61,6 @@ local function get_virt_texts(start, last)
 		{ last, 1000 },
 		{ type = "virt_text", details = true }
 	)
-	local foo = 42
 
 	local virt_texts = {}
 	for _, vt in ipairs(extmarks) do
@@ -72,7 +73,7 @@ end
 local function handle_event(event)
 	if event.type == "ModeChanged" then
 		local modes = config.get("modes") or {}
-		return { { text = modes[event.new_mode], source = "meta" } }
+		return { { text = modes[event.new_mode], source = "meta", event = event } }
 	else
 		if event.type == "CursorMoved" then
 			local new_cursor_pos = event.new_cursor_pos
@@ -82,14 +83,13 @@ local function handle_event(event)
 				local virt_texts = get_virt_texts(new_cursor_pos[1] - 1, new_cursor_pos[1] - 1)
 
 				local utterances = {
-					{ text = string.format("%d", event.new_cursor_pos[1]), source = "lnum" },
-					{ text = lines[1], source = "line" },
+					{ text = string.format("%d", event.new_cursor_pos[1]), source = "lnum", event = event },
+					{ text = lines[1], source = "line", event = event },
 				}
 
 				for _, vt in ipairs(virt_texts) do
-					vim.print(vt)
 					if string.match(vt, "^%s*@") == nil then -- Don't speak indent guides
-						table.insert(utterances, { text = vt, source = "virt_text" })
+						table.insert(utterances, { text = vt, source = "virt_text", event = event })
 					end
 				end
 
@@ -126,6 +126,7 @@ local function setup_autocmds()
 				local new_cursor_pos = vim.api.nvim_win_get_cursor(0)
 				if new_cursor_pos[1] ~= cursor_pos[1] or new_cursor_pos[2] ~= cursor_pos[2] then
 					local old_cursor_pos = cursor_pos
+					cursor_pos = new_cursor_pos
 
 					local utterances = dispatch_event({
 						type = "CursorMoved",
@@ -151,7 +152,7 @@ local function setup_autocmds()
 
 				if mode_changed_counter == 0 and new_mode ~= mode then
 					local old_mode = mode
-					local mode = new_mode
+					mode = new_mode
 
 					log.trace("Switch mode to", mode)
 
@@ -199,7 +200,7 @@ M.schedule_utterances = function(utterances)
 		final_utterances = postprocess(final_utterances)
 	end
 
-	schedule_utterances(final_utterances)
+	schedule_utterances(utils.expand_special_chars(final_utterances))
 end
 
 return M
