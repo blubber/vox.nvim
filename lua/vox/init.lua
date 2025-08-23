@@ -1,206 +1,407 @@
-local log = require("vox.dev").log
-local config = require("vox.config")
-local utils = require("vox.utils")
+local ts_utils = require("nvim-treesitter.ts_utils")
 
 local M = {}
 
-local mode = "n"
-local cursor_pos = { 1, 0 }
-local scheduled_utterances = {}
-local scheduled_utterances_timer = nil
+local uv = vim.loop
 
-local function dispatch_utterances()
-	config.get("backend"):speak(scheduled_utterances)
-	scheduled_utterances = {}
+local state = {
+	opts = {},
+	cursor_pos = {},
+	augroup = nil,
+	cursor_moved_timer = uv.new_timer(),
+	enabled = true,
+}
+
+local function defaults()
+	return {
+		mappings = {
+			["'"] = " single quote",
+			['"'] = "double quote",
+			["["] = "bracker",
+			["]"] = "bracker",
+			["("] = "parenthesis",
+			[")"] = "parenthesis",
+			["<"] = "angle",
+			[">"] = "angle",
+			["{"] = "brace",
+			["}"] = "brace",
+			["="] = "equals",
+			["."] = "dot",
+		},
+		whitespace = {
+			[" "] = "space",
+			["\n"] = "newline",
+			["\t"] = "tab",
+		},
+		modes = {
+			["R"] = "replace",
+			["S"] = "select line",
+			["V"] = "visual line",
+			["\19"] = "select block",
+			["\22"] = "visual block",
+			["c"] = "command",
+			["i"] = "insert",
+			["n"] = "normal",
+			["s"] = "select",
+			["t"] = "terminal",
+			["v"] = "visual",
+		},
+
+		cursor_moved_debounce = 150,
+		on_row_changed = { "row", "line", "diagnostics" },
+		on_col_changed = { "character" },
+		on_mode_changed = { "mode" },
+		on_buf_read = { M.say("Open"), "filename" },
+		on_buf_delete = { M.say("Close"), "filename" },
+		on_buf_write = { M.say("Save"), "filename" },
+		on_buf_enter = { M.filename },
+		backend = nil,
+	}
 end
 
-local function schedule_utterances(utterances)
-	if #utterances == 0 then
-		return
+local function get_cursor_pos()
+	local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+	return { row = row, col = col }
+end
+
+local function get_ts_node_text_under_cursor()
+	local node = ts_utils.get_node_at_cursor()
+	if not node then
+		return nil
 	end
 
-	for _, u in ipairs(utterances) do
-		table.insert(scheduled_utterances, u)
+	local bufnr = vim.api.nvim_get_current_buf()
+	local text = vim.treesitter.get_node_text(node, bufnr)
+
+	return text
+end
+
+local function split_by_delimiters(line)
+	local result = {}
+	local pos = 1
+	local current_type = nil
+	local buf = ""
+
+	local open = "({[<"
+	local close = ")]}>"
+
+	while pos <= #line do
+		local char = line:sub(pos, pos)
+		local char_type = "text"
+
+		if string.find(open, char, 1, true) ~= nil then
+			char_type = "open"
+		elseif string.find(close, char, 1, true) ~= nil then
+			char_type = "close"
+		end
+
+		if char_type ~= current_type and #buf > 0 then
+			table.insert(result, { type = current_type, content = buf })
+			buf = ""
+		end
+
+		current_type = char_type
+		buf = buf .. char
+
+		pos = pos + 1
 	end
 
-	if scheduled_utterances_timer ~= nil then
-		vim.fn.timer_stop(scheduled_utterances_timer)
+	if #buf > 0 then
+		table.insert(result, { type = current_type, content = buf })
 	end
 
-	scheduled_utterances_timer = vim.fn.timer_start(config.get("wait_time"), function()
-		scheduled_utterances_timer = nil
-		dispatch_utterances()
+	return result
+end
+
+local function expand(line)
+	local s = line
+	for _, pair in ipairs(state.mappings) do
+		local key, value = unpack(pair)
+		s = string.gsub(s, key, value)
+	end
+
+	return s
+end
+
+local function list_line_diagnostics()
+	local bufnr = vim.api.nvim_get_current_buf()
+	local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+
+	local diags = vim.diagnostic.get(bufnr, { lnum = row })
+
+	return diags
+end
+
+function M.setup(opts)
+	state.opts = vim.tbl_deep_extend("force", defaults(), opts or {})
+
+	state.cursor_pos = get_cursor_pos()
+	state.augroup = vim.api.nvim_create_augroup("VoxAugroup", { clear = true })
+
+	-- Prepare mappings for expand()
+	local keys = {}
+	for k in pairs(state.opts.mappings) do
+		table.insert(keys, k)
+	end
+
+	table.sort(keys, function(a, b)
+		return #a > #b
 	end)
+
+	state.mappings = {}
+	for _, k in ipairs(keys) do
+		local escaped_key = (string.gsub(k, "([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
+		local value = string.format(" %s ", state.opts.mappings[k])
+		table.insert(state.mappings, { escaped_key, value })
+	end
+
+	vim.api.nvim_create_autocmd("CursorMoved", {
+		group = state.augroup,
+		pattern = "*", -- apply to all buffers
+		callback = function()
+			local cursor_pos = get_cursor_pos()
+			local delta = {
+				row = cursor_pos.row - state.cursor_pos.row,
+				col = cursor_pos.col - state.cursor_pos.col,
+			}
+
+			if delta.row ~= 0 or delta.col ~= 0 then
+				state.cursor_pos = cursor_pos
+
+				state.cursor_moved_timer:stop()
+				state.cursor_moved_timer:start(
+					state.opts.cursor_moved_debounce,
+					0,
+					vim.schedule_wrap(function()
+						if delta.row ~= 0 then
+							M.speak(state.opts.on_row_changed)
+						elseif delta.col ~= 0 then
+							M.speak(state.opts.on_col_changed)
+						end
+					end)
+				)
+			end
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("ModeChanged", {
+		group = state.augroup,
+		pattern = "*",
+		callback = function(ev)
+			local old_mode, new_mode = ev.match:match("([^:]+):([^:]+)")
+			if old_mode ~= new_mode then
+				M.speak(state.opts.on_mode_changed)
+			end
+		end,
+	})
+
+	local commands = {
+		["BufReadPost"] = "on_buf_red",
+		["BufWritePost"] = "on_buf_write",
+		["BufDelete"] = "on_buf_delete",
+		["BufEnter"] = "on_buf_enter",
+	}
+
+	for event, name in pairs(commands) do
+		vim.api.nvim_create_autocmd(event, {
+			group = state.augroup,
+			pattern = "*",
+			callback = function()
+				local utterances = state.opts[name]
+				M.speak(utterances)
+			end,
+		})
+	end
+
+	vim.api.nvim_create_user_command("Vox", function(cmdopts)
+		local arg = cmdopts.args ~= "" and cmdopts.args or "toggle"
+
+		if arg == "toggle" then
+			state.enabled = not state.enabled
+		elseif arg == "enable" then
+			state.enabled = true
+		elseif arg == "disable" then
+			state.enabled = false
+		elseif arg == "stop" then
+			M.stop()
+		end
+	end, {
+		nargs = "?",
+		complete = function(_, _, _)
+			return { "stop", "enable", "disable", "toggle" }
+		end,
+	})
+
+	vim.api.nvim_create_user_command("VoxSpeak", function(cmdopts)
+		local arg = cmdopts.args ~= "" and cmdopts.args or "line"
+
+		if arg == "line" then
+			M.speak(M.line())
+		elseif arg == "row" then
+			M.speak(M.row())
+		elseif arg == "col" then
+			M.speak(M.col())
+		elseif arg == "word" then
+			M.speak(M.word())
+		elseif arg == "node" then
+			M.speak(M.node())
+		elseif arg == "diag" then
+			M.speak(M.diagnostics())
+		elseif arg == "mode" then
+			M.speak(M.mode())
+		elseif arg == "filename" or arg == "file" then
+			M.speak(M.filename())
+		end
+	end, {
+		nargs = "?", -- optional single argument
+		range = true,
+		complete = function(_, _, _)
+			return { "line", "row", "col", "word", "token", "diag", "mode", "filename", "file" }
+		end,
+	})
 end
 
-local function flatten(t)
-	if type(t) ~= "table" then
-		return t
+function M.stop()
+	M.speak({ source = "line", content = "" })
+end
+
+local function is_utterance(value)
+	if type(value) == "table" then
+		return value.source ~= nil and value.content ~= nil
+	end
+
+	return false
+end
+
+local function flatten(list)
+	if is_utterance(list) then
+		return { list }
 	end
 
 	local result = {}
-	for _, v in ipairs(t) do
-		if type(v) == "table" then
-			local tt = flatten(v)
-			for _, e in ipairs(tt) do
-				table.insert(result, e)
+
+	for _, value in ipairs(list) do
+		if type(value) == "function" then
+			value = value()
+		elseif type(value) == "string" then
+			local func = M[value]
+			value = func()
+		end
+
+		if is_utterance(value) then
+			result[#result + 1] = value
+		elseif type(value) == "table" then
+			for _, nested_value in ipairs(flatten(value)) do
+				result[#result + 1] = nested_value
 			end
-		else
-			table.insert(result, v)
 		end
 	end
 
 	return result
 end
 
-local function get_virt_texts(start, last)
-	local extmarks = vim.api.nvim_buf_get_extmarks(
-		0,
-		-1,
-		{ start, 0 },
-		{ last, 1000 },
-		{ type = "virt_text", details = true }
-	)
-
-	local virt_texts = {}
-	for _, vt in ipairs(extmarks) do
-		table.insert(virt_texts, vt[4]["virt_text"])
-	end
-
-	return flatten(virt_texts)
-end
-
-local function handle_event(event)
-	if event.type == "ModeChanged" then
-		local modes = config.get("modes") or {}
-		return { { text = modes[event.new_mode], source = "meta", event = event } }
-	else
-		if event.type == "CursorMoved" then
-			local new_cursor_pos = event.new_cursor_pos
-
-			if new_cursor_pos[1] ~= event.old_cursor_pos[1] then
-				local lines = vim.api.nvim_buf_get_lines(0, new_cursor_pos[1] - 1, new_cursor_pos[1], false)
-				local virt_texts = get_virt_texts(new_cursor_pos[1] - 1, new_cursor_pos[1] - 1)
-
-				local utterances = {
-					{ text = string.format("%d", event.new_cursor_pos[1]), source = "lnum", event = event },
-					{ text = lines[1], source = "line", event = event },
-				}
-
-				for _, vt in ipairs(virt_texts) do
-					if string.match(vt, "^%s*@") == nil then -- Don't speak indent guides
-						table.insert(utterances, { text = vt, source = "virt_text", event = event })
-					end
-				end
-
-				return utterances
-			end
-		end
-	end
-
-	return {}
-end
-
-local function dispatch_event(event)
-	local handler = config.get("event_handler")
-
-	if handler ~= nil then
-		return handler(event, handle_event)
-	else
-		return handle_event(event)
-	end
-end
-
-local function setup_autocmds()
-	local group = vim.api.nvim_create_augroup("vox", { clear = true })
-
-	local cursor_moved_timer = nil
-	vim.api.nvim_create_autocmd("CursorMoved", {
-		group = group,
-		callback = function()
-			if cursor_moved_timer ~= nil then
-				cursor_moved_timer = vim.fn.timer_stop(cursor_moved_timer)
-			end
-
-			cursor_moved_timer = vim.fn.timer_start(config.get("wait_time"), function()
-				local new_cursor_pos = vim.api.nvim_win_get_cursor(0)
-				if new_cursor_pos[1] ~= cursor_pos[1] or new_cursor_pos[2] ~= cursor_pos[2] then
-					local old_cursor_pos = cursor_pos
-					cursor_pos = new_cursor_pos
-
-					local utterances = dispatch_event({
-						type = "CursorMoved",
-						old_cursor_pos = old_cursor_pos,
-						new_cursor_pos = new_cursor_pos,
-					})
-					M.schedule_utterances(utterances)
-				end
-			end)
-		end,
-	})
-
-	local mode_changed_counter = 0
-
-	vim.api.nvim_create_autocmd("ModeChanged", {
-		group = group,
-		callback = function()
-			mode_changed_counter = mode_changed_counter + 1
-			local new_mode = vim.v.event.new_mode
-
-			vim.schedule(function()
-				mode_changed_counter = mode_changed_counter - 1
-
-				if mode_changed_counter == 0 and new_mode ~= mode then
-					local old_mode = mode
-					mode = new_mode
-
-					log.trace("Switch mode to", mode)
-
-					local utterances = handle_event({
-						type = "ModeChanged",
-						old_mode = old_mode,
-						new_mode = mode,
-					})
-					M.schedule_utterances(utterances)
-				end
-			end)
-		end,
-	})
-end
-
-M.setup = function(user_config)
-	log.trace("setup")
-
-	config.setup(user_config)
-
-	setup_autocmds()
-
-	vim.api.nvim_create_user_command("Vox", function()
-		M.schedule_utterances({ { text = "Test command", source = "line" } })
-	end, { range = true })
-
-	log.debug("Vox setup done")
-end
-
-M.schedule_utterances = function(utterances)
-	if utterances == nil or #utterances == 0 then
+function M.speak(utterances)
+	if utterances == nil or vim.tbl_isempty(utterances) or not state.enabled then
 		return
 	end
 
-	local final_utterances = {}
-	for _, utterance in ipairs(utterances) do
-		utterance.text = string.gsub(utterance.text or "", "^%s*(.-)%s*$", "%1")
-		if utterance.text ~= "" then
-			table.insert(final_utterances, utterance)
+	utterances = flatten(utterances)
+
+	state.opts.backend.speak(utterances)
+end
+
+function M.row()
+	return { source = "linenr", content = string.format("%d", state.cursor_pos.row) }
+end
+
+function M.col()
+	return { source = "linenr", content = string.format("%d", state.cursor_pos.col + 1) }
+end
+
+function M.line()
+	local line = vim.api.nvim_get_current_line()
+	local parts = split_by_delimiters(line)
+
+	local utterances = {}
+	for _, part in ipairs(parts) do
+		local source = "line"
+
+		if part.type == "open" then
+			source = "special.open"
+		elseif part.type == "close" then
+			source = "special.close"
 		end
+
+		table.insert(utterances, { source = source, content = expand(part.content) })
 	end
 
-	local postprocess = config.get("postprocess")
-	if postprocess ~= nil then
-		final_utterances = postprocess(final_utterances)
+	return utterances
+end
+
+function M.word()
+	local word = vim.fn.expand("<cword>")
+	return { source = "line", content = word }
+end
+
+function M.node()
+	local node = get_ts_node_text_under_cursor()
+	return { source = "line", content = node }
+end
+
+function M.character()
+	local col = state.cursor_pos.col + 1
+	local line = vim.api.nvim_get_current_line()
+	local char = line:sub(col, col)
+
+	char = state.opts.whitespace[char] or char
+
+	return { source = "line", content = char }
+end
+
+function M.diagnostics()
+	local utterances = {}
+	local diagnostics = list_line_diagnostics()
+
+	for _, d in ipairs(diagnostics) do
+		local severity = d.severity and vim.diagnostic.severity[d.severity] or ""
+		utterances[#utterances + 1] = { source = "diagnostic", content = string.format("%s %s", severity, d.message) }
 	end
 
-	schedule_utterances(utils.expand_special_chars(final_utterances))
+	return utterances
+end
+
+function M.mode()
+	local mode = vim.fn.mode()
+	local mode_name = state.opts.modes[mode]
+
+	if mode_name then
+		return { source = "line", content = mode_name }
+	else
+		return { source = "line", content = string.format("Mode %s", mode) }
+	end
+end
+
+function M.filename()
+	local filepath = vim.api.nvim_buf_get_name(0)
+
+	if filepath == "" then
+		return { source = "line", content = "Unknown file" }
+	end
+
+	local cwd = vim.fn.getcwd()
+
+	if string.sub(filepath, 1, #cwd) == cwd then
+		local relative_path = string.sub(filepath, #cwd + 2)
+		return { source = "line", content = expand(relative_path) }
+	else
+		return { source = "line", content = expand(filepath) }
+	end
+end
+
+function M.say(content)
+	return function()
+		return { source = "line", content = content }
+	end
 end
 
 return M
