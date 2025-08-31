@@ -9,6 +9,7 @@ local state = {
 	cursor_pos = {},
 	augroup = nil,
 	cursor_moved_timer = uv.new_timer(),
+	suspend = false,
 	enabled = true,
 }
 
@@ -173,6 +174,11 @@ function M.setup(opts)
 					state.opts.cursor_moved_debounce,
 					0,
 					vim.schedule_wrap(function()
+						if state.suspend then
+							state.suspend = false
+							return
+						end
+
 						if delta.row ~= 0 then
 							M.speak(state.opts.on_row_changed)
 						elseif delta.col ~= 0 then
@@ -188,6 +194,11 @@ function M.setup(opts)
 		group = state.augroup,
 		pattern = "*",
 		callback = function(ev)
+			if state.suspend then
+				state.suspend = false
+				return
+			end
+
 			local old_mode, new_mode = ev.match:match("([^:]+):([^:]+)")
 			if old_mode ~= new_mode then
 				M.speak(state.opts.on_mode_changed)
@@ -207,6 +218,11 @@ function M.setup(opts)
 			group = state.augroup,
 			pattern = "*",
 			callback = function()
+				if state.suspend then
+					state.suspend = false
+					return
+				end
+
 				local utterances = state.opts[name]
 				M.speak(utterances)
 			end,
@@ -259,6 +275,10 @@ function M.setup(opts)
 			return { "line", "row", "col", "word", "token", "diag", "mode", "filename", "file" }
 		end,
 	})
+end
+
+function M.suspend()
+	state.suspend = true
 end
 
 function M.stop()
