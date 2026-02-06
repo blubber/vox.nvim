@@ -1,5 +1,3 @@
-local ts_utils = require("nvim-treesitter.ts_utils")
-
 local M = {}
 
 local uv = vim.loop
@@ -66,7 +64,7 @@ local function get_cursor_pos()
 end
 
 local function get_ts_node_text_under_cursor()
-	local node = ts_utils.get_node_at_cursor()
+	local node = vim.treesitter.get_node_at_cursor()
 	if not node then
 		return nil
 	end
