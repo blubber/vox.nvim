@@ -54,6 +54,7 @@ local function defaults()
 		on_buf_delete = { M.say("Close"), "filename" },
 		on_buf_write = { M.say("Save"), "filename" },
 		on_buf_enter = { M.filename },
+		telescope = true,
 		backend = nil,
 	}
 end
@@ -273,6 +274,10 @@ function M.setup(opts)
 			return { "line", "row", "col", "word", "token", "diag", "mode", "filename", "file" }
 		end,
 	})
+
+	if state.opts.telescope then
+		require("vox.telescope").setup(M)
+	end
 end
 
 function M.suspend()
